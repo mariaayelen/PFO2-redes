@@ -65,7 +65,7 @@ Para salir del cliente, cerrar sesión y elegir la opción `0`. Para detener el 
 
 ### 2. Intento de registrar un usuario existente
 
-<img src="imagenes/registro-usuario-existente.png" width="450">
+<img src="imagenes/registro-usario-existente.png" width="450">
 
 ### 3. Base de datos de usuarios
 
