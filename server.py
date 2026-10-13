@@ -1,162 +1,210 @@
-import socket
+﻿import os
+import secrets
 import sqlite3
-from datetime import datetime
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template_string, request, session
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 # CONFIGURACIÓN DEL SERVIDOR
-# Datos que va a usar el servidor para conectarse
-
 HOST = "localhost"
 PORT = 5000
-DB = "mensajes.db"
-
+DB = Path(__file__).with_name("tareas.db")
+app = Flask(__name__)
+# Para pruebas locales, la clave cambia al reiniciar si no hay variable de entorno.
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
 # BASE DE DATOS
+def conectar_db():
+    conexion = sqlite3.connect(DB)
+    conexion.row_factory = sqlite3.Row
+    conexion.execute("PRAGMA foreign_keys = ON")
+    return conexion
 
-# Aquí creamos la base de datos y la tabla donde se van a guardar los mensajes
+
 def crear_db():
-    """Crea la base de datos y la tabla si todavía no existen."""
+    """Crea las tablas si todavía no existen."""
+    conexion = conectar_db()
     try:
-        conexion = sqlite3.connect(DB)
-        cursor = conexion.cursor()
-
-        # Si la tabla no existe todavía, la crea automáticamente
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS mensajes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                contenido TEXT NOT NULL,
-                fecha_envio TEXT NOT NULL,
-                ip_cliente TEXT NOT NULL
-            )
-        """)
-
-        # Guardamos los cambios hechos en la base
+        conexion.execute('''CREATE TABLE IF NOT EXISTS usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario TEXT NOT NULL UNIQUE,
+            contraseña TEXT NOT NULL
+        )''')
+        conexion.execute('''CREATE TABLE IF NOT EXISTS tareas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            descripcion TEXT NOT NULL,
+            completada INTEGER NOT NULL DEFAULT 0,
+            usuario_id INTEGER NOT NULL REFERENCES usuarios(id)
+        )''')
         conexion.commit()
-        conexion.close()
-
-        print("Base de datos creada correctamente.")
-
-    except sqlite3.Error as error:
-        print("Error al acceder a la base de datos:", error)
-
-# Acá guardamos cada mensaje que llega con lo que solicitamos en este caso contenido, fecha y la ip del cliente que lo envió.
-def guardar_mensaje(contenido, fecha, ip_cliente):
-    """Guarda el mensaje recibido."""
-
-
-# Agregamos el mensaje recibido a la tabla mensajes de nuestra base de datos. Si hay un error, lo mostramos.
-    try:
-        conexion = sqlite3.connect(DB)
-        cursor = conexion.cursor()
-
-        cursor.execute("""
-            INSERT INTO mensajes (contenido, fecha_envio, ip_cliente)
-            VALUES (?, ?, ?)
-        """, (contenido, fecha, ip_cliente))
-
-        conexion.commit()
-        conexion.close()
-
-    except sqlite3.Error as error:
-        print("Error al guardar el mensaje:", error)
-
-
-
-# SOCKET DEL SERVIDOR
-
-# Creamos el socket que va a esperar la conexión del cliente
-def crear_servidor():
-    """Crea y configura el socket del servidor."""
-
-    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    try:
-        servidor.bind((HOST, PORT))
-        servidor.listen()
-
-        print(f"Servidor escuchando en {HOST}:{PORT}...")
-
-        return servidor
-
-# Si el puerto ya está ocupado, mostramos el problema
-    except OSError as error:
-        print("No se pudo iniciar el servidor.")
-        print("Puede ser que el puerto esté ocupado.")
-        print("Error:", error)
-
-        servidor.close()
-
-        return None
-
-
-
-# RECIBIR MENSAJES
-
-#Aquí recibimos los mensajes que envía el cliente y lo guardamos en la DB.
-def atender_cliente(conn, addr):
-
-    ip_cliente = addr[0]
-
-    print(f"\nCliente conectado desde {ip_cliente}")
-
-    while True:
-
-        try:
-            mensaje = conn.recv(1024).decode("utf-8")
-
-            if not mensaje:
-                break
-
-            print(f"Mensaje recibido: {mensaje}")
-
-
-            # Guardamos la fecha y hora exacta en la que llegó el mensaje
-            fecha = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-            guardar_mensaje(mensaje, fecha, ip_cliente)
-
-            respuesta = f"Mensaje recibido: {fecha}"
-
-            conn.sendall(respuesta.encode("utf-8"))
-
-        except ConnectionError:
-            print("Se perdió la conexión con el cliente.")
-            break
-
-    print("Cliente desconectado.")
-
-
-
-# P. PRINCIPAL
-
-# Primero preparamos la base y después ponemos en marcha el servidor
-def ejecutar_servidor():
-
-    crear_db()
-
-    servidor = crear_servidor()
-
-    if servidor is None:
-        return
-
-    try:
-
-        while True:
-
-            print("\nEsperando conexión...")
-
-            conn, addr = servidor.accept()
-
-            with conn:
-                atender_cliente(conn, addr)
-
-    except KeyboardInterrupt:
-        print("\nServidor detenido.")
-
     finally:
-        servidor.close()
+        conexion.close()
 
-# Aquí hacemos que el servidor arranque cuando ejecutamos este archivo
+
+def leer_datos():
+    datos = request.get_json(silent=True)
+    if isinstance(datos, dict):
+        return datos
+    return {}
+
+
+def leer_texto(datos, campo):
+    valor = datos.get(campo)
+    if isinstance(valor, str):
+        return valor
+    return ""
+
+
+# REGISTRO Y SESIONES
+@app.post("/registro")
+def registrar_usuario():
+    datos = leer_datos()
+    usuario = leer_texto(datos, "usuario").strip()
+    contraseña = leer_texto(datos, "contraseña")
+    if not usuario or not contraseña.strip():
+        return jsonify(mensaje="Completá el usuario y la contraseña."), 400
+    contraseña_hash = generate_password_hash(contraseña)
+    conexion = conectar_db()
+    try:
+        conexion.execute(
+            "INSERT INTO usuarios (usuario, contraseña) VALUES (?, ?)",
+            (usuario, contraseña_hash),
+        )
+        conexion.commit()
+    except sqlite3.IntegrityError:
+        return jsonify(mensaje="Ese usuario ya existe."), 409
+    finally:
+        conexion.close()
+    return jsonify(mensaje="Usuario registrado correctamente."), 201
+
+
+@app.post("/login")
+def iniciar_sesion():
+    datos = leer_datos()
+    usuario = leer_texto(datos, "usuario").strip()
+    contraseña = leer_texto(datos, "contraseña")
+    conexion = conectar_db()
+    try:
+        registro = conexion.execute(
+            "SELECT * FROM usuarios WHERE usuario = ?", (usuario,)
+        ).fetchone()
+    finally:
+        conexion.close()
+    if registro is None or not check_password_hash(registro["contraseña"], contraseña):
+        return jsonify(mensaje="Usuario o contraseña incorrectos."), 401
+    session.clear()
+    session["usuario_id"] = registro["id"]
+    session["usuario"] = registro["usuario"]
+    return jsonify(mensaje="Sesión iniciada.")
+
+
+@app.post("/logout")
+def cerrar_sesion():
+    session.clear()
+    return jsonify(mensaje="Sesión cerrada.")
+
+
+@app.get("/tareas")
+def mostrar_bienvenida():
+    return render_template_string('''<!doctype html>
+        <html lang="es">
+        <head><meta charset="utf-8"><title>Mis tareas</title></head>
+        <body><h1>Sistema de Gestión de Tareas</h1>
+        {% if usuario %}
+            <p>Bienvenido/a, {{ usuario }}.</p>
+            <p>Podés administrar tus tareas desde el cliente de consola.</p>
+        {% else %}
+            <p>Necesitás iniciar sesión primero.</p>
+        {% endif %}
+        </body></html>''', usuario=session.get("usuario"))
+
+
+@app.before_request
+def verificar_sesion():
+    if request.path.startswith("/api/tareas") and "usuario_id" not in session:
+        return jsonify(mensaje="Necesitás iniciar sesión primero."), 401
+
+
+# GESTIÓN DE TAREAS
+@app.get("/api/tareas")
+def consultar_tareas():
+    conexion = conectar_db()
+    try:
+        tareas = conexion.execute(
+            "SELECT id, descripcion, completada FROM tareas WHERE usuario_id = ? ORDER BY id",
+            (session["usuario_id"],),
+        ).fetchall()
+    finally:
+        conexion.close()
+    return jsonify(tareas=[dict(tarea) for tarea in tareas])
+
+
+@app.post("/api/tareas")
+def agregar_tarea():
+    descripcion = leer_texto(leer_datos(), "descripcion").strip()
+    if not descripcion:
+        return jsonify(mensaje="La descripción no puede estar vacía."), 400
+    conexion = conectar_db()
+    try:
+        cursor = conexion.execute(
+            "INSERT INTO tareas (descripcion, usuario_id) VALUES (?, ?)",
+            (descripcion, session["usuario_id"]),
+        )
+        conexion.commit()
+        tarea_id = cursor.lastrowid
+    finally:
+        conexion.close()
+    return jsonify(mensaje="Tarea agregada correctamente.", id=tarea_id), 201
+
+
+@app.put("/api/tareas/<int:tarea_id>")
+def completar_tarea(tarea_id):
+    conexion = conectar_db()
+    try:
+        cursor = conexion.execute(
+            "UPDATE tareas SET completada = 1 WHERE id = ? AND usuario_id = ?",
+            (tarea_id, session["usuario_id"]),
+        )
+        conexion.commit()
+        modificadas = cursor.rowcount
+    finally:
+        conexion.close()
+    if modificadas == 0:
+        return jsonify(mensaje="Tarea no encontrada."), 404
+    return jsonify(mensaje="Tarea completada.")
+
+
+@app.delete("/api/tareas/<int:tarea_id>")
+def eliminar_tarea(tarea_id):
+    conexion = conectar_db()
+    try:
+        cursor = conexion.execute(
+            "DELETE FROM tareas WHERE id = ? AND usuario_id = ?",
+            (tarea_id, session["usuario_id"]),
+        )
+        conexion.commit()
+        eliminadas = cursor.rowcount
+    finally:
+        conexion.close()
+    if eliminadas == 0:
+        return jsonify(mensaje="Tarea no encontrada."), 404
+    return jsonify(mensaje="Tarea eliminada.")
+
+
+@app.errorhandler(sqlite3.Error)
+def error_base_datos(error):
+    app.logger.error("Error de SQLite: %s", error)
+    return jsonify(mensaje="No se pudo acceder a la base de datos."), 500
+
+
+def ejecutar_servidor():
+    crear_db()
+    app.run(host=HOST, port=PORT, debug=False)
+
+
 if __name__ == "__main__":
     ejecutar_servidor()
